@@ -1,6 +1,9 @@
 param(
     [string]$TaskName = "Auto SEU-WLAN",
     [string]$Python = "python",
+    [string]$EnvFile = "",
+    [string]$LogFile = "",
+    [switch]$StartNow,
     [switch]$DryRun
 )
 
@@ -8,14 +11,16 @@ $ErrorActionPreference = "Stop"
 
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script = Join-Path $ScriptRoot "auto_seuwlan.py"
-$EnvFile = Join-Path $ScriptRoot ".env"
+if (-not $EnvFile) {
+    $EnvFile = Join-Path $ScriptRoot ".env"
+}
+if (-not $LogFile) {
+    $LogDir = Join-Path $ScriptRoot "logs"
+    $LogFile = Join-Path $LogDir "auto_seuwlan.log"
+}
 
 if (-not (Test-Path -LiteralPath $Script)) {
     throw "Cannot find script: $Script"
-}
-
-if (-not (Test-Path -LiteralPath $EnvFile)) {
-    Write-Warning "Cannot find .env: $EnvFile. The task can still be registered, but login will fail until .env exists."
 }
 
 $PythonCommand = Get-Command $Python -ErrorAction Stop
@@ -24,7 +29,7 @@ if (-not $PythonExe) {
     $PythonExe = $Python
 }
 
-$Arguments = "`"$Script`" --daemon --env `"$EnvFile`""
+$Arguments = "`"$Script`" --daemon --env `"$EnvFile`" --log-file `"$LogFile`""
 $TaskCommand = "`"$PythonExe`" $Arguments"
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
@@ -33,9 +38,16 @@ if ($DryRun) {
     Write-Host "User: $CurrentUser"
     Write-Host "Execute: $PythonExe"
     Write-Host "Arguments: $Arguments"
+    Write-Host "LogFile: $LogFile"
     Write-Host "Fallback schtasks /TR: $TaskCommand"
     exit 0
 }
+
+if (-not (Test-Path -LiteralPath $EnvFile)) {
+    Write-Warning "Cannot find .env: $EnvFile. The task can still be registered, but login will fail until .env exists."
+}
+
+New-Item -ItemType Directory -Path (Split-Path -Parent $LogFile) -Force | Out-Null
 
 try {
     $Action = New-ScheduledTaskAction -Execute $PythonExe -Argument $Arguments -WorkingDirectory $ScriptRoot
@@ -57,6 +69,11 @@ try {
         -ErrorAction Stop | Out-Null
 
     Write-Host "Registered scheduled task for current user: $TaskName"
+    Write-Host "Log file: $LogFile"
+    if ($StartNow) {
+        Start-ScheduledTask -TaskName $TaskName
+        Write-Host "Started scheduled task: $TaskName"
+    }
     exit 0
 }
 catch {
@@ -73,3 +90,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ($Output -join [Environment]::NewLine)
 Write-Host "Registered scheduled task for current user: $TaskName"
+Write-Host "Log file: $LogFile"
+if ($StartNow) {
+    & schtasks.exe /Run /TN $TaskName | Out-Host
+}
