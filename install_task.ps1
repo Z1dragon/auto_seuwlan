@@ -3,6 +3,7 @@ param(
     [string]$Python = "python",
     [string]$EnvFile = "",
     [string]$LogFile = "",
+    [switch]$Console,
     [switch]$StartNow,
     [switch]$DryRun
 )
@@ -29,14 +30,27 @@ if (-not $PythonExe) {
     $PythonExe = $Python
 }
 
+$TaskPythonExe = $PythonExe
+if (-not $Console) {
+    $PythonDir = Split-Path -Parent $PythonExe
+    $Pythonw = Join-Path $PythonDir "pythonw.exe"
+    if (Test-Path -LiteralPath $Pythonw) {
+        $TaskPythonExe = $Pythonw
+    }
+    else {
+        Write-Warning "pythonw.exe was not found next to $PythonExe. The task will use python.exe and may show a console window."
+    }
+}
+
 $Arguments = "`"$Script`" --daemon --env `"$EnvFile`" --log-file `"$LogFile`""
-$TaskCommand = "`"$PythonExe`" $Arguments"
+$TaskCommand = "`"$TaskPythonExe`" $Arguments"
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 if ($DryRun) {
     Write-Host "TaskName: $TaskName"
     Write-Host "User: $CurrentUser"
-    Write-Host "Execute: $PythonExe"
+    Write-Host "Execute: $TaskPythonExe"
+    Write-Host "Console: $([bool]$Console)"
     Write-Host "Arguments: $Arguments"
     Write-Host "LogFile: $LogFile"
     Write-Host "Fallback schtasks /TR: $TaskCommand"
@@ -50,7 +64,7 @@ if (-not (Test-Path -LiteralPath $EnvFile)) {
 New-Item -ItemType Directory -Path (Split-Path -Parent $LogFile) -Force | Out-Null
 
 try {
-    $Action = New-ScheduledTaskAction -Execute $PythonExe -Argument $Arguments -WorkingDirectory $ScriptRoot
+    $Action = New-ScheduledTaskAction -Execute $TaskPythonExe -Argument $Arguments -WorkingDirectory $ScriptRoot
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
     $Settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `

@@ -95,6 +95,10 @@ https://w.seu.edu.cn/a79.htm?UserIP=10.x.x.x&wlanacname=...
 | `SEUWLAN_ISP` | 校园网留空；运营商账号可填 `c/cmcc`、`t/telecom`、`u/unicom` |
 | `SEUWLAN_INTERVAL` | daemon 模式检查间隔，默认 60 秒 |
 | `SEUWLAN_TIMEOUT` | HTTP 请求超时，默认 5 秒 |
+| `SEUWLAN_PORTAL_RETRIES` | Wi-Fi 重连后继续探测 Portal 的次数，默认 5 |
+| `SEUWLAN_PORTAL_RETRY_WAIT` | 每次 Portal 探测之间等待秒数，默认 5 |
+| `SEUWLAN_FALLBACK_PORTAL_URLS` | 自动跳转拿不到时尝试访问的 SEU Portal 地址 |
+| `SEUWLAN_LOCAL_IP` | 可选，Portal URL 不含 `UserIP` 时手动指定本机 IPv4 |
 | `SEUWLAN_LOG_FILE` | 可选，日志文件路径 |
 | `SEUWLAN_USE_SYSTEM_PROXY` | 默认 `0`，联网探测和认证均绕过系统代理 |
 
@@ -120,6 +124,18 @@ SEUWLAN_USE_SYSTEM_PROXY=0
 
 ```powershell
 .\install_task.ps1 -StartNow
+```
+
+默认会使用 `pythonw.exe` 注册后台任务，不显示命令行窗口。日志写入：
+
+```text
+logs\auto_seuwlan.log
+```
+
+如果你需要调试并显示命令行窗口，可以显式使用：
+
+```powershell
+.\install_task.ps1 -Console
 ```
 
 查看将要注册的命令但不实际写入：
@@ -148,7 +164,40 @@ logs\auto_seuwlan.log
 
 ### 挂着 VPN 时打不开 `msftconnecttest`
 
-脚本已经默认绕过系统代理。如果仍然失败，通常是 VPN TUN 模式或虚拟网卡接管了路由，需要在 VPN 客户端设置校园网网关直连。
+脚本不依赖浏览器打开 `http://www.msftconnecttest.com`，并且默认绕过系统代理。联网探测会优先访问不依赖 DNS 的 HTTP IP 地址，再尝试 `msftconnecttest`，最后还会尝试 `w.seu.edu.cn/a79.htm` 作为 SEU Portal 兜底。
+
+如果浏览器在挂代理时打不开 `msftconnecttest`，不一定影响脚本自动认证；先看 `logs\auto_seuwlan.log`。如果脚本也失败，通常是 VPN TUN 模式或虚拟网卡接管了路由，需要在代理/VPN 客户端给以下地址设置直连：
+
+```text
+w.seu.edu.cn
+1.1.1.1
+223.5.5.5
+www.msftconnecttest.com
+```
+
+也可以把浏览器跳出的真实 Portal URL 写入 `.env` 的 `SEUWLAN_LOGIN_URL` 或 `seuwlan.local.md`。
+
+### 开机后出现 `UnicodeDecodeError: gbk codec can't decode`
+
+这是 Windows/Conda 在读取 `netsh` 输出时按 GBK 解码失败导致的。新版脚本已经改为按字节捕获并容错解码，不会再因为本地化输出或异常字节导致 daemon 线程报错。
+
+### 开机后短暂提示 `no portal URL found`
+
+开机初期 Wi-Fi、DNS 和校园网 Portal 可能还没有准备好。脚本会在 Wi-Fi 重连后按 `SEUWLAN_PORTAL_RETRIES` / `SEUWLAN_PORTAL_RETRY_WAIT` 多探测几轮；如果随后已经联网，会直接返回成功。
+
+### 关掉开机启动的命令行窗口后不再自动重连
+
+旧版本计划任务使用 `python.exe`，关闭命令行窗口会结束 daemon。新版 `install_task.ps1` 默认使用 `pythonw.exe` 注册后台任务，不显示窗口，也不会因为关闭窗口而停止。升级后重新运行：
+
+```powershell
+.\install_task.ps1
+```
+
+然后通过日志查看状态：
+
+```powershell
+Get-Content .\logs\auto_seuwlan.log -Wait
+```
 
 ### `portal_type: unknown`
 

@@ -7,13 +7,14 @@ import os
 import platform
 import random
 import re
+import socket
 import ssl
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 from urllib import error, parse, request
 
 
@@ -24,9 +25,15 @@ URL_RE = re.compile(r"https?://[^\s<>()\"']+")
 LOG_FILE: Optional[Path] = None
 
 DEFAULT_CHECK_URLS = (
+    "http://1.1.1.1/",
+    "http://223.5.5.5/",
     "http://www.msftconnecttest.com/connecttest.txt",
-    "http://1.1.1.1",
     "http://www.baidu.com/",
+)
+
+DEFAULT_FALLBACK_PORTAL_URLS = (
+    "https://w.seu.edu.cn/a79.htm",
+    "http://w.seu.edu.cn/a79.htm",
 )
 
 RET_CODE_MESSAGES = {
@@ -88,23 +95,33 @@ def configure_logging(log_file: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         LOG_FILE = path
     except OSError as exc:
-        print(f"[{timestamp()}] WARN  cannot create log directory for {path}: {exc}", flush=True)
+        safe_print(f"[{timestamp()}] WARN  cannot create log directory for {path}: {exc}")
 
 
 def timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def safe_print(message: str) -> None:
+    if sys.stdout is None:
+        return
+    try:
+        print(message, flush=True)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def log(level: str, message: str) -> None:
     line = f"[{timestamp()}] {level.upper():5s} {message}"
-    print(line, flush=True)
     if not LOG_FILE:
+        safe_print(line)
         return
     try:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError:
         pass
+    safe_print(line)
 
 
 def load_env_file(path: Path) -> None:
@@ -158,6 +175,34 @@ def split_urls(value: str) -> Tuple[str, ...]:
     return urls or DEFAULT_CHECK_URLS
 
 
+def split_fallback_portal_urls(value: str) -> Tuple[str, ...]:
+    urls = tuple(part.strip() for part in re.split(r"[,;]", value) if part.strip())
+    return urls or DEFAULT_FALLBACK_PORTAL_URLS
+
+
+def decode_command_output(data: bytes) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "mbcs"):
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def run_command(command: Sequence[str], timeout: float) -> Tuple[int, str]:
+    completed = subprocess.run(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        timeout=timeout,
+    )
+    output = decode_command_output(completed.stdout or completed.stderr).strip()
+    return completed.returncode, output
+
+
 def looks_like_placeholder_url(url: str) -> bool:
     lowered = url.lower()
     return any(token in lowered for token in ("...", "<", ">", "10.x", "your_", "your-"))
@@ -170,7 +215,7 @@ def extract_first_url_from_markdown(path: Path) -> Optional[str]:
     match = URL_RE.search(text)
     if not match:
         return None
-    url = match.group(0).rstrip(".,;]}>，。；")
+    url = match.group(0).rstrip(".,;]}>")
     return None if looks_like_placeholder_url(url) else url
 
 
@@ -207,6 +252,21 @@ def infer_portal_type(url: Optional[str]) -> str:
     ):
         return "seu_eportal"
     return "unknown"
+
+
+def looks_like_portal_body(body: str) -> bool:
+    lowered = body[:4096].lower()
+    markers = (
+        "eportal",
+        "drcom",
+        "portal",
+        "wlanacname",
+        "wlan_user_ip",
+        "a79.htm",
+        "\u4e0a\u7f51\u767b\u5f55",
+        "\u6821\u56ed\u7f51",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def mask(value: str) -> str:
@@ -296,8 +356,7 @@ def probe_connectivity(check_urls: Iterable[str], timeout: float, use_proxy: boo
                 return ProbeResult(False, redirected, result.status, f"portal redirect: {portal_type}")
             return ProbeResult(True, None, result.status, f"{check_url} redirected normally")
 
-        body_head = result.body[:2048].lower()
-        if infer_portal_type(result.url) != "unknown" or "eportal" in body_head:
+        if infer_portal_type(result.url) != "unknown" or looks_like_portal_body(result.body):
             return ProbeResult(False, result.url, result.status, "portal page returned")
         if result.status in (200, 204, 301, 302):
             return ProbeResult(True, None, result.status, f"{check_url} returned {result.status}")
@@ -305,6 +364,68 @@ def probe_connectivity(check_urls: Iterable[str], timeout: float, use_proxy: boo
         last_error = f"{check_url} returned {result.status}"
 
     return ProbeResult(False, None, None, last_error)
+
+
+def probe_fallback_portals(urls: Iterable[str], timeout: float, use_proxy: bool) -> ProbeResult:
+    last_error = "fallback portal probes failed"
+    for portal_url in urls:
+        portal_type = infer_portal_type(portal_url)
+        if portal_type == "unknown":
+            last_error = f"{portal_url}: unsupported fallback portal URL"
+            continue
+        try:
+            result = http_get(portal_url, timeout=timeout, allow_redirects=False, use_proxy=use_proxy)
+        except RuntimeError as exc:
+            last_error = f"{portal_url}: {exc}"
+            continue
+
+        location = result.headers.get("Location") or result.headers.get("location")
+        if 300 <= result.status < 400 and location:
+            redirected = parse.urljoin(portal_url, location)
+            if infer_portal_type(redirected) != "unknown":
+                return ProbeResult(False, redirected, result.status, "fallback portal redirect")
+        if result.status in (200, 401, 403) or looks_like_portal_body(result.body):
+            return ProbeResult(False, portal_url, result.status, "fallback portal URL is reachable")
+        last_error = f"{portal_url} returned {result.status}"
+    return ProbeResult(False, None, None, last_error)
+
+
+def wait_for_portal_or_online(
+    check_urls: Iterable[str],
+    timeout: float,
+    use_proxy: bool,
+    attempts: int,
+    delay: float,
+) -> ProbeResult:
+    attempts = max(1, attempts)
+    last_probe = ProbeResult(False, None, None, "connectivity probe was not run")
+    for attempt in range(1, attempts + 1):
+        last_probe = probe_connectivity(check_urls, timeout, use_proxy)
+        if last_probe.online or last_probe.portal_url:
+            return last_probe
+        if attempt < attempts and delay > 0:
+            log("info", f"portal not ready yet ({last_probe.message}); retrying in {delay:g}s")
+            time.sleep(delay)
+    return last_probe
+
+
+def get_local_ipv4() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1)
+            sock.connect(("1.1.1.1", 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    try:
+        for item in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if item and not item.startswith("127."):
+                return item
+    except OSError:
+        pass
+    return ""
 
 
 def connect_wifi(profile: str, wait_seconds: float) -> bool:
@@ -316,18 +437,12 @@ def connect_wifi(profile: str, wait_seconds: float) -> bool:
 
     cmd = ["netsh", "wlan", "connect", f"name={profile}"]
     try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        returncode, output = run_command(cmd, timeout=15)
     except (OSError, subprocess.SubprocessError) as exc:
         log("warn", f"failed to invoke netsh: {exc}")
         return False
 
-    output = (completed.stdout or completed.stderr or "").strip()
-    if completed.returncode == 0:
+    if returncode == 0:
         log("info", f"requested Wi-Fi connection to profile '{profile}'")
         if wait_seconds > 0:
             time.sleep(wait_seconds)
@@ -406,7 +521,7 @@ def summarize_portal_response(body: str) -> Tuple[bool, str]:
 
     text = body.strip()
     lowered = text.lower()
-    if '"result":"1"' in text or '"result":1' in text or "success" in lowered or "成功" in text:
+    if '"result":"1"' in text or '"result":1' in text or "success" in lowered or "\u6210\u529f" in text:
         return True, "portal response looks successful"
     excerpt = " ".join(text.split())[:240]
     return False, excerpt or "empty portal response"
@@ -423,10 +538,11 @@ def login_seu_eportal(
     use_proxy: bool,
     callback: str,
     js_version: str,
+    local_ip: str,
 ) -> Tuple[bool, str]:
     parsed = parse.urlparse(login_url)
     login_user = apply_isp_suffix(username, isp)
-    wlan_user_ip = first_query_value(parsed, ("UserIP", "wlanuserip", "wlan_user_ip"))
+    wlan_user_ip = first_query_value(parsed, ("UserIP", "wlanuserip", "wlan_user_ip")) or local_ip or get_local_ipv4()
     wlan_ac_name = first_query_value(parsed, ("wlanacname", "wlan_ac_name"))
     wlan_ac_ip = first_query_value(parsed, ("wlanacip", "wlan_ac_ip"))
 
@@ -473,6 +589,11 @@ def run_once(args: argparse.Namespace) -> bool:
     timeout = get_float(args, "timeout", "SEUWLAN_TIMEOUT", 5.0)
     check_urls = split_urls(get_str(args, "check_urls", "SEUWLAN_CHECK_URLS", ",".join(DEFAULT_CHECK_URLS)))
     use_proxy = args.use_system_proxy or env_flag("SEUWLAN_USE_SYSTEM_PROXY", False)
+    portal_retries = get_int(args, "portal_retries", "SEUWLAN_PORTAL_RETRIES", 5)
+    portal_retry_wait = get_float(args, "portal_retry_wait", "SEUWLAN_PORTAL_RETRY_WAIT", 5.0)
+    fallback_portal_urls = split_fallback_portal_urls(
+        get_str(args, "fallback_portal_urls", "SEUWLAN_FALLBACK_PORTAL_URLS", ",".join(DEFAULT_FALLBACK_PORTAL_URLS))
+    )
     configured_url, configured_source = configured_login_url(args)
     login_url = configured_url
 
@@ -485,7 +606,7 @@ def run_once(args: argparse.Namespace) -> bool:
             login_url = probe.portal_url
             log("info", f"network needs authentication ({probe.message}); using live portal URL")
         else:
-            log("info", f"network needs authentication ({probe.message})")
+            log("info", f"network is not ready or needs authentication ({probe.message})")
 
     profile = get_str(args, "wifi_profile", "SEUWLAN_WIFI_PROFILE", "SEU-WLAN")
     wait_seconds = get_float(args, "wifi_wait", "SEUWLAN_WIFI_WAIT", 5.0)
@@ -498,12 +619,25 @@ def run_once(args: argparse.Namespace) -> bool:
         connect_wifi(profile, wait_seconds)
 
     if not login_url:
-        probe = probe_connectivity(check_urls, timeout, use_proxy)
+        probe = wait_for_portal_or_online(check_urls, timeout, use_proxy, portal_retries, portal_retry_wait)
+        if probe.online:
+            log("info", f"already online after Wi-Fi reconnect ({probe.message})")
+            return True
         if probe.portal_url:
             login_url = probe.portal_url
 
     if not login_url:
-        log("error", f"no portal URL found; set SEUWLAN_LOGIN_URL or put the redirected URL in {configured_source}")
+        fallback_probe = probe_fallback_portals(fallback_portal_urls, timeout, use_proxy)
+        if fallback_probe.portal_url:
+            login_url = fallback_probe.portal_url
+            log("info", f"using fallback portal URL ({fallback_probe.message})")
+
+    if not login_url:
+        message = f"no portal URL found yet; set SEUWLAN_LOGIN_URL or put the redirected URL in {configured_source}"
+        if args.daemon:
+            log("warn", f"{message}; will retry on next daemon interval")
+        else:
+            log("error", message)
         return False
 
     portal_type = infer_portal_type(login_url)
@@ -522,6 +656,7 @@ def run_once(args: argparse.Namespace) -> bool:
     mac = get_str(args, "mac", "SEUWLAN_MAC", "000000000000")
     callback = get_str(args, "callback", "SEUWLAN_CALLBACK", "dr1003")
     js_version = get_str(args, "js_version", "SEUWLAN_JS_VERSION", "3.3.3")
+    local_ip = get_str(args, "local_ip", "SEUWLAN_LOCAL_IP", "")
     ok, message = login_seu_eportal(
         login_url,
         username,
@@ -533,6 +668,7 @@ def run_once(args: argparse.Namespace) -> bool:
         use_proxy,
         callback,
         js_version,
+        local_ip,
     )
     log("info" if ok else "error", message)
     if not ok or args.dry_run:
@@ -558,6 +694,9 @@ def detect(args: argparse.Namespace) -> int:
     timeout = get_float(args, "timeout", "SEUWLAN_TIMEOUT", 5.0)
     check_urls = split_urls(get_str(args, "check_urls", "SEUWLAN_CHECK_URLS", ",".join(DEFAULT_CHECK_URLS)))
     use_proxy = args.use_system_proxy or env_flag("SEUWLAN_USE_SYSTEM_PROXY", False)
+    fallback_portal_urls = split_fallback_portal_urls(
+        get_str(args, "fallback_portal_urls", "SEUWLAN_FALLBACK_PORTAL_URLS", ",".join(DEFAULT_FALLBACK_PORTAL_URLS))
+    )
     probe = probe_connectivity(check_urls, timeout, use_proxy)
     if probe.portal_url:
         print("source: live captive-portal redirect")
@@ -573,6 +712,14 @@ def detect(args: argparse.Namespace) -> int:
         print("note: network is already online, so no captive-portal login URL is currently exposed.")
         return 0
 
+    fallback_probe = probe_fallback_portals(fallback_portal_urls, timeout, use_proxy)
+    if fallback_probe.portal_url:
+        print("source: fallback SEU portal URL")
+        print(f"login_url: {redact_url(fallback_probe.portal_url)}")
+        print(f"portal_type: {infer_portal_type(fallback_probe.portal_url)}")
+        print(f"probe: {probe.message}; {fallback_probe.message}")
+        return 0
+
     print(f"source: {source}")
     print("login_url: <none>")
     print("portal_type: unknown")
@@ -584,7 +731,7 @@ def detect(args: argparse.Namespace) -> int:
 
 def command_exists(command: str) -> bool:
     try:
-        subprocess.run([command, "/?" if command.lower() == "netsh" else "--version"], capture_output=True, timeout=5)
+        run_command([command, "/?" if command.lower() == "netsh" else "--version"], timeout=5)
         return True
     except (OSError, subprocess.SubprocessError):
         return False
@@ -594,15 +741,13 @@ def scheduled_task_exists(task_name: str) -> Optional[bool]:
     if platform.system().lower() != "windows":
         return None
     try:
-        result = subprocess.run(
+        returncode, _ = run_command(
             ["schtasks.exe", "/Query", "/TN", task_name],
-            capture_output=True,
-            text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return result.returncode == 0
+    return returncode == 0
 
 
 def yesno(value: bool) -> str:
@@ -652,8 +797,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--callback", default=None, help="ePortal JSONP callback name")
     parser.add_argument("--js-version", default=None, help="ePortal jsVersion parameter")
     parser.add_argument("--check-urls", default=None, help="comma separated connectivity probe URLs")
+    parser.add_argument("--fallback-portal-urls", default=None, help="comma separated SEU portal URLs used when captive redirect cannot be discovered")
+    parser.add_argument("--local-ip", default=None, help="local IPv4 address to send as wlan_user_ip when the portal URL has no UserIP")
     parser.add_argument("--interval", default=None, help="daemon check interval in seconds")
     parser.add_argument("--timeout", default=None, help="HTTP timeout in seconds")
+    parser.add_argument("--portal-retries", default=None, help="probe retries after Wi-Fi reconnect")
+    parser.add_argument("--portal-retry-wait", default=None, help="seconds between post-reconnect portal probes")
     parser.add_argument("--log-file", default=None, help="append logs to this file")
     parser.add_argument("--task-name", default=None, help="scheduled task name used by --doctor")
     parser.add_argument("--daemon", action="store_true", help="keep checking and reconnecting")

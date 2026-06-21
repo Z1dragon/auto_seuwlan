@@ -52,6 +52,14 @@ class AutoSeuwlanTests(unittest.TestCase):
                 "https://w.seu.edu.cn/a79.htm?UserIP=10.1.2.3&wlanacname=AP01",
             )
 
+    def test_decode_command_output_tolerates_invalid_bytes(self):
+        decoded = app.decode_command_output(b"\xaf\xffnetsh output")
+        self.assertIn("netsh output", decoded)
+
+    def test_looks_like_portal_body(self):
+        self.assertTrue(app.looks_like_portal_body("<html>wlanacname=AP01</html>"))
+        self.assertFalse(app.looks_like_portal_body("<html>plain page</html>"))
+
 
 if __name__ == "__main__":
     unittest.main()
