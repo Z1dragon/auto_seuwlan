@@ -549,16 +549,37 @@ def run_once(args: argparse.Namespace) -> bool:
 
 def detect(args: argparse.Namespace) -> int:
     url, source = configured_login_url(args)
-    if not url:
+    if url:
+        print(f"source: {source}")
+        print(f"login_url: {redact_url(url)}")
+        print(f"portal_type: {infer_portal_type(url)}")
+        return 0
+
+    timeout = get_float(args, "timeout", "SEUWLAN_TIMEOUT", 5.0)
+    check_urls = split_urls(get_str(args, "check_urls", "SEUWLAN_CHECK_URLS", ",".join(DEFAULT_CHECK_URLS)))
+    use_proxy = args.use_system_proxy or env_flag("SEUWLAN_USE_SYSTEM_PROXY", False)
+    probe = probe_connectivity(check_urls, timeout, use_proxy)
+    if probe.portal_url:
+        print("source: live captive-portal redirect")
+        print(f"login_url: {redact_url(probe.portal_url)}")
+        print(f"portal_type: {infer_portal_type(probe.portal_url)}")
+        print(f"probe: {probe.message}")
+        return 0
+    if probe.online:
         print(f"source: {source}")
         print("login_url: <none>")
-        print("portal_type: unknown")
-        print("note: no URL was found; paste the redirected login URL into seuwlan.md or SEUWLAN_LOGIN_URL")
-        return 1
+        print("portal_type: none")
+        print(f"probe: {probe.message}")
+        print("note: network is already online, so no captive-portal login URL is currently exposed.")
+        return 0
+
     print(f"source: {source}")
-    print(f"login_url: {redact_url(url)}")
-    print(f"portal_type: {infer_portal_type(url)}")
-    return 0
+    print("login_url: <none>")
+    print("portal_type: unknown")
+    print(f"probe: {probe.message}")
+    print("note: no configured URL or live portal redirect was found.")
+    print("action: disconnect/reconnect SEU-WLAN and retry, or paste the redirected login URL into SEUWLAN_LOGIN_URL or seuwlan.local.md.")
+    return 1
 
 
 def command_exists(command: str) -> bool:

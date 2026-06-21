@@ -49,6 +49,8 @@ python .\auto_seuwlan.py --doctor
 python .\auto_seuwlan.py --detect
 ```
 
+如果输出 `login_url: <none>`，说明当前没有配置静态链接，并且本次探测没有拿到校园网登录页跳转。通常有两种情况：你已经在线，或者还没有连接到 `SEU-WLAN`。断开/重连 `SEU-WLAN` 后再执行一次，或把浏览器跳转后的登录链接写入 `seuwlan.local.md`。
+
 5. 单次重连和认证：
 
 ```powershell
